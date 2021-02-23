@@ -1,0 +1,241 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'NextCloud on AWS using EC2 and S3'
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: Select a VPC that allows instances access to the Internet.
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: Select a subnet in your selected VPC.
+  InstanceType:
+    Description: EC2 instance type. Because of the additional swap partition, Nexcloud will also run on the smallest instances
+    Type: String
+    Default: t2.micro
+    ConstraintDescription: Please choose a valid instance type.
+  LatestUbuntuAMI:
+    Description: Latest Ubuntu AMI ID from Parameter Store.
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: '/aws/service/canonical/ubuntu/server/20.04/stable/current/amd64/hvm/ebs-gp2/ami-id'
+  TagName: 
+    Description: Tag all resources with the same Name tag
+    Type: String
+    Default: NextCloud
+  FullyQualifiedDomainName:
+    Description: Domain you want to run Nextcloud on
+    Type: String
+    Default: e.g. nextcloud.mydomain.com
+  EmailLetsEncrypt:
+    Description: The Lets's Encrypt Certbot requires an email adress, e.g. to notify in case the certificate could not be renewed.
+    Type: String
+    Default: e.g. letsencrypt@mydomain.com
+  PhpMemoryLimit:
+    Type: String
+    Default: 512M
+  PartitionSizeSwap:
+    Description: Size of EBS volume used as swap partition
+    Type: Number
+    Default: 2
+  PartitionSizeRoot:
+    Description: Size of EBS volume used as root partition
+    Type: Number
+    Default: 8
+  EbsOptimizedVolumes:
+    Description: Add extra performance for EBS volumes but comes at an additional charge for some instances
+    Type: String
+    Default: false
+  NextcloudAdminUsername:
+    Description: Nextcloud Admin user name
+    Type: String
+    MinLength: 3
+  NextcloudAdminPassword:
+    Description: Nextcloud Admin user password
+    Type: String
+    NoEcho: true
+    MinLength: 12
+  KernelSwappiness:
+    Description: Swappiness kernel setting to increase RAM usage
+    Type: Number
+    Default: 10
+Resources:
+  NextcloudEIPAssociation:
+    Type: AWS::EC2::EIPAssociation
+    Properties: 
+      AllocationId: !ImportValue  NextcloudEIPAllocationId 
+      InstanceId: !Ref NextcloudInstance
+  NextcloudInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      SecurityGroupIds:
+      - !Ref NextcloudSecurityGroup
+      SubnetId: !Ref SubnetId
+      InstanceType: !Ref InstanceType
+      ImageId: !Ref LatestUbuntuAMI
+      IamInstanceProfile: !Ref 'NextcloudInstanceProfile'
+      EbsOptimized: !Ref EbsOptimizedVolumes
+      UserData:
+        Fn::Base64: !Sub |
+          #cloud-config
+          repo_update: true
+          repo_upgrade: all
+
+          mounts:
+            - [ /dev/sdb, none, swap, sw, 0, 0 ]
+
+          bootcmd:
+          - mkswap /dev/xvdb
+          - swapon /dev/xvdb
+
+          packages:
+            - snapd
+
+          runcmd:
+            - [ sh, -c, "hostnamectl set-hostname ${FullyQualifiedDomainName}" ]
+            - [ sh, -c, "sysctl vm.swappiness=${KernelSwappiness}" ]
+            - [ sh, -c, "snap install nextcloud" ]
+            - [ sh, -c, "snap set nextcloud php.memory-limit=${PhpMemoryLimit}" ]
+            - [ sh, -c, "nextcloud.manual-install ${NextcloudAdminUsername} ${NextcloudAdminPassword}" ]
+            - [ sh, -c, "nextcloud.occ config:system:set trusted_domains 1 --value=$(curl http://169.254.169.254/latest/meta-data/public-ipv4)" ]
+            - [ sh, -c, "nextcloud.occ config:system:set trusted_domains 2 --value=${FullyQualifiedDomainName}" ]
+            - [ sh, -c, "printf 'y\n${EmailLetsEncrypt}\n${FullyQualifiedDomainName}' | nextcloud.enable-https lets-encrypt" ]
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeType: gp2
+            VolumeSize: !Ref PartitionSizeRoot
+            DeleteOnTermination: false
+            Encrypted: true
+        - DeviceName: /dev/sdb
+          Ebs:
+            VolumeType: gp2
+            VolumeSize: !Ref PartitionSizeSwap
+            DeleteOnTermination: true
+            Encrypted: true
+      Tags: 
+        - Key: "Name"
+          Value: !Ref TagName
+  NextcloudRole:
+    Type: AWS::IAM::Role
+    Properties:
+      ManagedPolicyArns: 
+        - 'arn:aws:iam::aws:policy/AmazonSSMFullAccess'
+      AssumeRolePolicyDocument:
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: [ec2.amazonaws.com]
+          Action: ['sts:AssumeRole']
+      Path: /
+      Tags: 
+        - Key: "Name"
+          Value: !Ref TagName
+  NextcloudInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: /
+      Roles: [!Ref 'NextcloudRole']
+  NextcloudSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: NextCloud Security Group
+      VpcId: !Ref 'VpcId'
+      Tags: 
+        - Key: "Name"
+          Value: !Ref TagName
+  NextcloudSecurityGroupHTTPInbound:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref 'NextcloudSecurityGroup'
+      IpProtocol: tcp
+      FromPort: 80
+      ToPort: 80
+      CidrIp: 0.0.0.0/0
+  NextcloudSecurityGroupHTTPSInbound:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref 'NextcloudSecurityGroup'
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      CidrIp: 0.0.0.0/0
+  NextcloudS3Bucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub "${AWS::StackName}-bucket"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      AccessControl: Private
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: Nextcloud-OneZoneIARule
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 30
+                StorageClass: ONEZONE_IA
+          - Id: Nextcloud-DeleteOldVersions
+            Status: Enabled
+            NoncurrentVersionExpirationInDays: 365
+          - Id: Nextcloud-AbortIncompleteMultipartUpload
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 2
+      Tags: 
+        - Key: "Name"
+          Value: !Ref TagName
+  NextcloudIAMUser:
+    Type: AWS::IAM::User
+    Properties: 
+      UserName: 'Nextcloud-EC2-User'
+      Policies: 
+        - PolicyName: ec2-instance-access-s3-bucket
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action: ["s3:ListBucket", "s3:ListBucketVersions"]
+                Resource: !GetAtt [NextcloudS3Bucket, Arn]
+                Condition: 
+                  StringEquals:
+                    "aws:SourceVpc": !Ref VpcId
+              - Effect: Allow
+                Action: ["s3:GetObject*"]
+                Resource: !Join [ '', [!GetAtt [NextcloudS3Bucket, Arn], '/*']]
+                Condition: 
+                  StringEquals:
+                    "aws:SourceVpc": !Ref VpcId
+              - Effect: Allow
+                Action: ["s3:PutObject*"]
+                Resource: !Join [ '', [!GetAtt [NextcloudS3Bucket, Arn], '/*']]
+                Condition: 
+                  StringEquals:
+                    "aws:SourceVpc": !Ref VpcId
+              - Effect: Allow
+                Action: ["s3:DeleteObject"]
+                Resource: !Join [ '', [!GetAtt [NextcloudS3Bucket, Arn], '/*']]
+                Condition: 
+                  StringEquals:
+                    "aws:SourceVpc": !Ref VpcId
+      Tags: 
+        - Key: "Name"
+          Value: !Ref TagName
+  NextcloudIAMUserKey:
+    Type: AWS::IAM::AccessKey
+    Properties:
+      UserName:
+        Ref: NextcloudIAMUser
+Outputs:
+  S3DomainName:
+    Value: !GetAtt [ NextcloudS3Bucket, RegionalDomainName]
+  PublicIp:
+    Value: !GetAtt [NextcloudInstance, PublicIp]
+  AccessKeyId:
+    Value: !Ref NextcloudIAMUserKey
+  SecretAccessKey:
+    Value: !GetAtt [NextcloudIAMUserKey, SecretAccessKey]
+
+    

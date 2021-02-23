@@ -1,0 +1,21 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'NextCloud on AWS using EC2 and S3'
+Parameters:
+  TagName: 
+    Description: Tag all resources with the same Name tag
+    Type: String
+    Default: NextCloud
+Resources:
+  NextcloudEIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      Tags: 
+        - Key: "Name"
+          Value: !Ref TagName
+Outputs:
+  NextcloudEIPAllocationId:
+    Value: !GetAtt  [ NextcloudEIP, AllocationId ]
+    Export:
+      Name: NextcloudEIPAllocationId
+  NextcloudEIPPublicIPv4:
+    Value: !Ref NextcloudEIP
